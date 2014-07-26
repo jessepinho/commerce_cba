@@ -1,0 +1,477 @@
+<?php
+
+/**
+ * @file
+ * Module file for Checkout by Amazon module.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_cba_menu() {
+  // Define a path to receive IPNs.
+  $items['commerce_cba/ipn'] = array(
+    'page callback' => 'commerce_cba_ipn',
+    'access callback' => TRUE,
+  );
+  $items['admin/commerce/orders/%commerce_order/payment/%commerce_payment_transaction/edit_cba'] = array(
+    'title' => 'Edit',
+    'page callback' => 'commerce_cba_admin_edit_transaction',
+    'page arguments' => array(3, 5),
+    'access callback' => 'commerce_cba_admin_edit_transaction_access',
+    'access arguments' => array(5),
+    'type' => MENU_LOCAL_TASK,
+    'context' => MENU_CONTEXT_INLINE,
+    'weight' => 20,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function commerce_cba_commerce_payment_method_info() {
+  return array(
+    'cba' => array(
+      'base' => 'commerce_cba',
+      'title' => t('Checkout by Amazon'),
+      'short_title' => t('Amazon'),
+      'description' => t('Integrates with Checkout by Amazon to allow buyers to use their Amazon.com accounts.'),
+      'offsite' => TRUE,
+    ),
+  );
+}
+
+/**
+ * Callback for payment settings form.
+ */
+function commerce_cba_settings_form($settings = array()) {
+  $form = array();
+
+  // Initiate the settings array.
+  $settings += array(
+    'merchantId' => '',
+    'accessKey' => '',
+    'secretKey' => '',
+    'mode' => 'sandbox',
+  );
+
+  $form['merchantId'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Merchant ID'),
+    '#default_value' => $settings['merchantId'],
+    '#required' => TRUE,
+  );
+  $form['accessKey'] = array(
+    '#type' => 'textfield',
+    '#title' => t('AWS Access Key ID'),
+    '#default_value' => $settings['accessKey'],
+    '#required' => TRUE,
+  );
+  $form['secretKey'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Secret Key'),
+    '#default_value' => $settings['secretKey'],
+    '#required' => TRUE,
+  );
+  $form['mode'] = array(
+    '#type' => 'radios',
+    '#title' => t('Mode'),
+    '#options' => array(
+      'sandbox' => ('Sandbox (for testing)'),
+      'production' => ('Production (for real transactions)'),
+    ),
+    '#default_value' => $settings['mode'],
+    '#required' => TRUE,
+  );
+
+  return $form;
+}
+
+/**
+ * Callback for redirect form.
+ *
+ * The redirect form is what redirects the buyer to Amazon's checkout flow.
+ */
+function commerce_cba_redirect_form($form, &$form_state, $order, $payment_method) {
+  // If the amount is less than or equal to 0, the user shouldn't have to pay.
+  // So advance the order if the order total is less than or equal to 0.
+  if ($order->commerce_order_total['und'][0]['amount'] <= 0) {
+    commerce_payment_redirect_pane_next_page($order);
+    drupal_goto('checkout/' . $order->order_id . '/complete');
+  }
+
+  $settings = $payment_method['settings'];
+  $defaults = array(
+    'currencyCode' => $order->commerce_order_total['und'][0]['currency_code'],
+    'weightUnit' => 'LB',
+    'cancelURL' => url('checkout/' . $order->order_id . '/payment/back/' . $order->data['payment_redirect_key'], array('absolute' => TRUE)),
+    'returnURL' => url('checkout/' . $order->order_id . '/payment/return/' . $order->data['payment_redirect_key'], array('absolute' => TRUE)),
+    'callbackEndpointURL' => url('commerce_cba/ipn', array('absolute' => TRUE)),
+  );
+
+  // Include the CBA SDK.
+  $path = libraries_get_path('AmazonPayments') . '/Model/';
+  foreach (array(
+    'Item',
+    'Cart',
+    'MandatoryProperties',
+    'OptionalProperties',
+    'Price',
+    'Promotion',
+    'ShippingMethod',
+    'ShippingRate',
+  ) as $include) {
+    require_once $path . $include . '.php';
+  }
+  require_once libraries_get_path('AmazonPayments') . '/Signature/SignatureCalculator.php';
+
+  // Initiate the Amazon cart.
+  $cart = new \AmazonPayments\Model\Cart($settings + $defaults);
+
+  // Add the order ID and payment method instance ID to it for when we receive
+  // an IPN.
+  $data = '<CustomData><OrderId>' . $order->order_id . '</OrderId>'
+    . '<PaymentMethodInstanceId>' . $payment_method['instance_id'] . '</PaymentMethodInstanceId></CustomData>';
+  $cart->setCartCustomData($data);
+
+  // Create a single line item with the order total.
+  $sku = 'n/a';
+  $title = t('Order total');
+  $price = (float)$order->commerce_order_total['und'][0]['amount'] / 100;
+  $currency_code = $order->commerce_order_total['und'][0]['currency_code'];
+  $quantity = 1;
+  $item = new \AmazonPayments\Model\Item($sku, $title, $price, $quantity);
+  $item->setCurrencyCode($currency_code);
+  $cart->addItem($item);
+
+  // Amazon adds its own shipping if we don't set it explicitly.
+  $rate = new \AmazonPayments\Model\ShippingRate();
+  $rate->setShipmentBasedRate(0.0);
+  $rate->setCurrencyCode($currency_code);
+  $shipMethod = new \AmazonPayments\Model\ShippingMethod(
+    \AmazonPayments\Model\ShippingMethod::REGION_WORLD_ALL,
+    \AmazonPayments\Model\ShippingMethod::SERVICE_STANDARD,
+    t('Shipping included in total'),
+    $rate
+  );
+  $cart->addShippingMethod($shipMethod);
+
+  // Set script src based on sandbox vs. production mode.
+  $script = ($settings['mode'] == 'sandbox') ? 'sandbox/' : '';
+  $script = 'https://static-na.payments-amazon.com/cba/js/us/' . $script . 'PaymentWidgets.js';
+
+  // Set image src based on sandbox vs. production mode.
+  $img = ($settings['mode'] == 'sandbox') ? '-sandbox' : '';
+  $img = 'https://payments' . $img . '.amazon.com/gp/cba/button?type=cart&cartOwnerId=' . $settings['merchantId'] . '&color=tan&size=medium&background=white';
+
+  $markup = '
+    <script type="text/javascript" src="' . $script . '"></script>
+
+    <div id="cbaButton1">
+        <img src="' . $img . '"/>
+    </div>
+    <script type="text/javascript">
+      new CBA.Widgets.StandardCheckoutWidget({
+        merchantId:"' . $settings['merchantId'] . '",
+        orderInput: {
+          format: "XML",
+          value: "' . $cart->createOrderInputValue() . '"
+        },
+        buttonSettings: { size: "medium",color:"tan",background:"white"}
+      }).render("cbaButton1");
+    </script>
+  ';
+
+  $form['button'] = array(
+    '#markup' => $markup,
+    '#weight' => 1,
+  );
+
+  // Create a "Go back" link.
+  $form['cancel'] = array(
+    '#type' => 'link',
+    '#href' => 'checkout/' . $order->order_id . '/payment/back/' . $order->data['payment_redirect_key'],
+    '#title' => t('Go back'),
+    '#weight' => 2,
+  );
+
+  return $form;
+}
+
+/**
+ * Callback for redirect form validation.
+ *
+ * This is run when the buyer returns from Amazon's checkout page.
+ */
+function commerce_cba_redirect_form_validate($order, $payment_method) {
+  return TRUE;
+}
+
+/**
+ * Menu callback; process an Amazon "Instant Order Processing Notification"
+ * (IPN).
+ */
+function commerce_cba_ipn() {
+  if (empty($_POST)) {
+    return;
+  }
+
+  // Log the request.
+  watchdog('commerce_cba', 'Checkout by Amazon notification: <pre>@notification</pre>', array('@notification' => print_r($_POST, 1)));
+
+  // Include the IPN class.
+  module_load_include('inc', 'commerce_cba', 'commerce_cba.ipn');
+  $ipn = new CommerceCbaIpn();
+
+  // Validate/authenticate/prepare the IPN.
+  commerce_cba_ipn_prepare($ipn);
+
+  // Check whether a transaction already exists for this order by checking
+  // against the remote order ID. If it does, load it. Otherwise, create a new
+  // transaction.
+  if (
+    empty($ipn->data->ProcessedOrder->AmazonOrderID)
+    || !$txn = commerce_cba_load_txn_by_amazon_id((string)$ipn->data->ProcessedOrder->AmazonOrderID)
+  ) {
+    $txn = commerce_payment_transaction_new('cba', $ipn->order->order_id);
+    $txn->instance_id = $ipn->payment_method['instance_id'];
+    if (!empty($ipn->data->ProcessedOrder->AmazonOrderID)) {
+      $txn->remote_id = (string)$ipn->data->ProcessedOrder->AmazonOrderID;
+    }
+  }
+
+  // Tally up the total, using USD as the default currency code.
+  $total = 0.0;
+  $code = 'USD';
+  foreach ($ipn->data->ProcessedOrder->ProcessedOrderItems->ProcessedOrderItem as $item) {
+    $total += (float)$item->Price->Amount;
+    // If a different currency code is being used, change to that one.
+    // @todo Find out whether there can be multiple currency codes per order.
+    if (!empty($item->Price->CurrencyCode)) {
+      $code = (string)$item->Price->CurrencyCode;
+    }
+  }
+  $txn->amount = commerce_currency_decimal_to_amount($total, $code);
+  $txn->currency_code = $code;
+
+  // Save the entire payload.
+  $txn->payload[REQUEST_TIME] = $_POST;
+
+  // Set the transaction's status based on the IPN's type.
+  $txn->remote_status = $ipn->type;
+  switch ($ipn->type) {
+    case 'NewOrderNotification':
+      $txn->status = COMMERCE_PAYMENT_STATUS_PENDING;
+      break;
+    case 'OrderReadyToShipNotification':
+      $txn->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+      break;
+    case 'OrderCancelledNotification':
+      $txn->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+      break;
+  }
+
+  // Save the transaction.
+  commerce_payment_transaction_save($txn);
+
+  // Move the order forward.
+  commerce_payment_redirect_pane_next_page($ipn->order);
+}
+
+/**
+ * Prepare an IPN request.
+ *
+ * This validates and authenticates the request. Then, it loads the order and
+ * payment_method entities, attaching them to $ipn.
+ */
+function commerce_cba_ipn_prepare($ipn) {
+  // Validate the request, sending an HTTP error code if necessary.
+  if (!$ipn->validate()) {
+    watchdog('commerce_cba', 'Validation failed.');
+    drupal_add_http_header('Status', '500 Internal Server Error');
+    drupal_exit();
+  }
+
+  // If the IPN validates, extract necessary data.
+  $order = (integer)$ipn->data->ProcessedOrder->ProcessedOrderItems->ProcessedOrderItem->CartCustomData->CustomData->OrderId;
+  $payment_method = (string)$ipn->data->ProcessedOrder->ProcessedOrderItems->ProcessedOrderItem->CartCustomData->CustomData->PaymentMethodInstanceId;
+
+  // Load the payment method so we can get the secret key.
+  $ipn->payment_method = commerce_payment_method_instance_load($payment_method);
+
+  // Authenticate the request, sending an HTTP error code if necessary.
+  if (!$ipn->authenticate($ipn->payment_method['settings']['secretKey'])) {
+    watchdog('commerce_cba', 'Authentication failed.');
+    drupal_add_http_header('Status', '403 Forbidden');
+    drupal_exit();
+  }
+
+  // Load the order.
+  $ipn->order = commerce_order_load($order);
+}
+
+/**
+ * Load a transaction by Amazon Order ID.
+ *
+ * @return
+ *   A commerce_payment_transaction entity object if one exists, or FALSE if
+ *   not.
+ */
+function commerce_cba_load_txn_by_amazon_id($id) {
+  $query = new EntityFieldQuery();
+  $query
+    ->entityCondition('entity_type', 'commerce_payment_transaction')
+    ->propertyCondition('remote_id', $id);
+  $txn = $query->execute();
+
+  if (!empty($txn['commerce_payment_transaction'])) {
+    $id = array_keys($txn['commerce_payment_transaction']);
+    return commerce_payment_transaction_load(reset($id));
+  }
+  return FALSE;
+}
+
+/**
+ * Menu callback; display a page for editing a transaction.
+ */
+function commerce_cba_admin_edit_transaction($order, $txn) {
+  drupal_set_title(t('Edit transaction #@id', array('@id' => $txn->transaction_id)));
+
+  return drupal_get_form('commerce_cba_admin_edit_transaction_form', $order, $txn);
+}
+
+/**
+ * Form callback; display a form for editing a transaction.
+ */
+function commerce_cba_admin_edit_transaction_form($form, &$form_state, $order, $txn) {
+  // Convert the price amount to the currency's major unit decimal value.
+  $amount = commerce_currency_amount_to_decimal($txn->amount, $txn->currency_code);
+
+  // Warn the user of the implications of editing a transaction.
+  $form['warning'] = array(
+    '#markup' => t("Editing a payment here will NOT affect the payment stored in Amazon's records! Only use this form if you know what you're doing."),
+  );
+  $form['amount'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Amount'),
+    '#default_value' => $amount,
+  );
+  $form['currency_code'] = array(
+    '#type' => 'select',
+    '#title' => t('Currency'),
+    '#options' => commerce_currency_code_options_list(),
+    '#default_value' => $txn->currency_code,
+  );
+  $form['status'] = array(
+    '#type' => 'select',
+    '#title' => t('Status'),
+    '#options' => array(
+      'pending' => t('Pending'),
+      'success' => t('Success'),
+      'failure' => t('Failure'),
+    ),
+    '#default_value' => $txn->status,
+  );
+  $form['order'] = array(
+    '#type' => 'value',
+    '#value' => $order,
+  );
+  $form['txn'] = array(
+    '#type' => 'value',
+    '#value' => $txn,
+  );
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Save'),
+  );
+
+  return $form;
+}
+
+function commerce_cba_admin_edit_transaction_form_submit($form, &$form_state) {
+  $order = $form_state['values']['order'];
+  $txn = $form_state['values']['txn'];
+
+  // Assign the new values to the transaction.
+  $txn->currency_code = $form_state['values']['currency_code'];
+  $txn->amount = commerce_currency_decimal_to_amount($form_state['values']['amount'], $txn->currency_code);
+  $txn->status = $form_state['values']['status'];
+
+  // Save the transaction.
+  commerce_payment_transaction_save($txn);
+
+  // Redirect to the order's payment page.
+  $redirect = commerce_order_ui_order_uri($order);
+  $redirect['path'] .= '/payment';
+  $form_state['redirect'] = $redirect;
+
+  // Set a message.
+  drupal_set_message(t('Payment updated.'));
+}
+
+/**
+ * Determine access to the "edit" link for a transaction.
+ *
+ * This checks whether the transaction is of type "cba," which, of course, is
+ * handled by this module.
+ */
+function commerce_cba_admin_edit_transaction_access($txn) {
+  return $txn->payment_method == 'cba' && commerce_payment_transaction_access('update', $txn);
+}
+
+/**
+ * Add elements to the "Add payment" form on an order's "Payment" tab.
+ *
+ * This form definition, as well as the submit handler below, are copied from
+ * commerce_braintree.module.
+ */
+function commerce_cba_submit_form($payment_method, $pane_values, $checkout_pane, $order) {
+  // Only show this form if this is an admin and we're in the admin UI. (We
+  // check the latter condition by checking whether $pane_values and
+  // $checkout_pane are empty.)
+  if (!user_access('administer payments') || !empty($checkout_pane)) {
+    return array();
+  }
+  $form['remote_id'] = array(
+    '#type' => 'textfield',
+    '#title' => t("Amazon's order ID"),
+  );
+  $form['status'] = array(
+    '#type' => 'select',
+    '#title' => t('Status'),
+    '#options' => array(
+      COMMERCE_PAYMENT_STATUS_SUCCESS => t('Success'),
+      COMMERCE_PAYMENT_STATUS_FAILURE => t('Failure'),
+      COMMERCE_PAYMENT_STATUS_PENDING => t('Pending'),
+    ),
+    '#default_value' => COMMERCE_PAYMENT_STATUS_SUCCESS,
+  );
+
+  return $form;
+}
+
+/**
+ * Handle submission of the "Add payment" form on an order's "Payment" tab.
+ */
+function commerce_cba_submit_form_submit($payment_method, $pane_form, $pane_values, $order, $charge) {
+  // Only handle this form submission in certain cases.
+  // @see commerce_cba_submit_form()
+  if (!user_access('administer payments') || empty($pane_values)) {
+    return;
+  }
+  // Create the transaction record.
+  $txn = commerce_payment_transaction_new('cba', $order->order_id);
+  $txn->instance_id = $payment_method['instance_id'];
+  if (!empty($pane_values['remote_id'])) {
+    $txn->remote_id = $pane_values['remote_id'];
+  }
+  $txn->status = $pane_values['status'];
+  $txn->amount = $charge['amount'];
+  $txn->currency_code = $charge['currency_code'];
+
+  // Save the transaction.
+  commerce_payment_transaction_save($txn);
+}
+
